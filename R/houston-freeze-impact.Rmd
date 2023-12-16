@@ -1,5 +1,5 @@
 ---
-title: 'EDS 223: assignment 3'
+title: 'Impact of Texas power crisis February 2021 on Houston city'
 author: "Amanda Herbst"
 date: "2023-12-15"
 output:
