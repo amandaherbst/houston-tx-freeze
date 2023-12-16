@@ -15,7 +15,7 @@ A workflow investigating the impact of power outages across Houston due to three
 |  └── income_distributions.png     # side-by-side plots on median income distribution for impacted and non-impacted tracts
 |
 ├── R/                                   # folder for code used in workflow
-|  └── houst-freeze-impact.rmd    # a R markdown containing background and workflow
+|  └── houston-freeze-impact.rmd    # a R markdown containing background and workflow
 |  └── houston-freeze-impact.html    # R markdown knitted to html
 |
 ├── README.md
