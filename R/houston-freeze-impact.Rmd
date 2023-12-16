@@ -1,0 +1,367 @@
+---
+title: 'EDS 223: assignment 3'
+author: "Amanda Herbst"
+date: "2023-12-15"
+output:
+    html_document:
+      print_df: paged
+      toc: yes
+      toc_depth: 4
+      toc_float: yes
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(include = TRUE, warning = FALSE, message = FALSE)
+```
+
+## Background
+
+"In February 2021, the state of Texas suffered a major power crisis, which came about as a result of three severe winter storms sweeping across the United States on February 10--11, 13--17, and 15--20."[^1] For more background, check out these [engineering](https://www.youtube.com/watch?v=08mwXICY4JM&ab_channel=PracticalEngineering) and [political](https://www.youtube.com/watch?v=Zcrsgdl_hP0&ab_channel=Vox) perspectives.
+
+[^1]: Wikipedia. 2021. "2021 Texas power crisis." Last modified October 2, 2021. <https://en.wikipedia.org/wiki/2021_Texas_power_crisis>.
+
+## Workflow Goals
+
+This workflow will investigate the impact of the 2021 major power crisis in Texas on the city of Houston by:
+
+- estimating the number of homes in Houston that lost power as a result of the first two storms
+- investigating if socioeconomic factors are predictors of communities recovery from a power outage
+
+The analysis will be based on remotely-sensed night lights data, acquired from the [Visible Infrared Imaging Radiometer Suite (VIIRS)](https://en.wikipedia.org/wiki/Visible_Infrared_Imaging_Radiometer_Suite) onboard the Suomi satellite. In particular, we will use the VNP46A1 to detect differences in night lights before and after the storm to identify areas that lost electric power.
+
+To determine the number of homes that lost power, we will spatially join these areas with [OpenStreetMap](https://www.openstreetmap.org/#map=4/38.01/-95.84) data on buildings and roads.
+
+To investigate potential socioeconomic factors that influenced recovery, we will link our analysis with data from the US Census Bureau.
+
+## Data Descriptions
+
+### Night lights
+
+Since satellites are limited by cloud cover, our options are limited, but 2021-02-07 and 2021-02-16 provide two clear, contrasting images to visualize the extent of the power outage in Texas.
+
+VIIRS data is distributed through NASA's [Level-1 and Atmospheric Archive & Distribution System Distributed Active Archive Center (LAADS DAAC)](https://ladsweb.modaps.eosdis.nasa.gov/). Many NASA Earth data products are distributed in 10x10 degree tiles in sinusoidal equal-area projection. Tiles are identified by their horizontal and vertical position in the grid. Houston lies on the border of tiles h08v05 and h08v06. We therefore need to download two tiles per date. The remote sensing data was downloaded, prepped, and stored locally in a folder labeled `VNP46A1`. 
+
+### Roads
+
+Typically highways account for a large portion of the night lights observable from space (see Google's [Earth at Night](https://earth.google.com/web/@27.44405464,-84.7693044,206.63660162a,8916361.52264659d,35y,0h,0t,0r/data=CiQSIhIgMGY3ZTJkYzdlOGExMTFlNjk5MGQ2ZjgxOGQ2OWE2ZTc)). To minimize falsely identifying areas with reduced traffic as areas without power, we will ignore areas near highways.
+
+[OpenStreetMap (OSM)](https://planet.openstreetmap.org/) is a collaborative project which creates publicly available geographic data of the world. Ingesting this data into a database where it can be subsetted and processed is a large undertaking. Fortunately, third party companies redistribute OSM data. Prior to this analysis, we used [Geofabrik's download sites](https://download.geofabrik.de/) to retrieve a shapefile of all highways in Texas and prepared a Geopackage (`.gpkg` file) containing just the subset of roads that intersect the Houston metropolitan area and stored it locally.
+
+### Houses
+
+We can also obtain building data from OpenStreetMap. We again downloaded from Geofabrick and prepared a GeoPackage containing only houses in the Houston metropolitan area, also storing it locally.
+
+### Socioeconomic
+
+We cannot readily get socioeconomic information for every home, so instead we obtained data from the [U.S. Census Bureau's American Community Survey](https://www.census.gov/programs-surveys/acs) for census tracts in 2019 in the form of an ArcGIS ["file geodatabase"](https://desktop.arcgis.com/en/arcmap/latest/manage-data/administer-file-gdbs/file-geodatabases.htm), a multi-file proprietary format that's roughly analogous to a GeoPackage file. Each layer contains a subset of the fields documents in the [ACS metadata](https://www2.census.gov/geo/docs/maps-data/data/tiger/prejoined/ACSMetadata2011.txt). The geodatabase contains a separate layer holding the geometry information. We will have to combine the geometry with the attributes to get a feature layer that `sf` can use.
+
+## Analysis
+
+```{r}
+# load necessary libraries
+library(tidyverse)
+library(sf)
+library(terra)
+library(stars)
+library(ggspatial)
+library(patchwork)
+```
+
+#### Find locations of blackouts
+
+For improved computational efficiency and easier interoperability with `sf`, we will be using the `stars` package for raster handling.
+
+##### combine the data
+
+Let's begin by reading in the night lights tiles as `stars` objects and combining the tiles for each date (2021-02-07 and 2021-02-16). `st_mosaic()` is super helpful for combining rasters.
+
+```{r include=TRUE}
+# read in night lights tiles as stars objects
+feb_7_v05 <- read_stars("~/Documents/github/eds223-assignments/assignment-3-amandaherbst/data/VNP46A1/VNP46A1.A2021038.h08v05.001.2021039064328.tif")
+feb_7_v06 <- read_stars("~/Documents/github/eds223-assignments/assignment-3-amandaherbst/data/VNP46A1/VNP46A1.A2021038.h08v06.001.2021039064329.tif")
+feb_16_v05 <- read_stars("~/Documents/github/eds223-assignments/assignment-3-amandaherbst/data/VNP46A1/VNP46A1.A2021047.h08v05.001.2021048091106.tif")
+feb_16_v06 <- read_stars("~/Documents/github/eds223-assignments/assignment-3-amandaherbst/data/VNP46A1/VNP46A1.A2021047.h08v06.001.2021048091105.tif")
+
+# combine each date into single object
+feb_7 <- st_mosaic(feb_7_v05, feb_7_v06)
+feb_16 <- st_mosaic(feb_16_v05, feb_16_v06)
+```
+
+##### create a blackout mask (10 points)
+
+We want to create a mask of where blackouts ocurred due to the storm. We can accomplish this by subtracting Feb. 16th from Feb 7th to find the change in night lights intensity that was presumably caused by the storm. To complete the mask, we'll assign `NA` to any pixel that experienced a drop of less than 200 nW cm^-2^sr^-1^.
+
+```{r include=TRUE}
+# create blackout mask from difference in night light intensity from 
+# 2/7/21 (before storm) and 2/26/21 (during storm)
+blackout_mask <- feb_7 - feb_16
+
+# assign NA to anywhere with less than 200 nW cm^-2^sr^-1
+blackout_mask[blackout_mask <= 200] = NA
+# now the mask only has values in places where blackouts occurred
+```
+
+Self-check what the blackout mask looks like
+
+```{r}
+plot(blackout_mask)
+```
+
+##### vectorize the mask
+
+For further analysis, we will now vectorize the mask so that it can interact with other `sf` objects. Some of the geometries may come out wonky, so we can use `st_make_valid` to fix any invalid geometries.
+
+```{r include=TRUE}
+# vectorize blackout mask 
+blackout_mask <- blackout_mask %>% 
+  st_as_sf() %>% 
+  # fix invalid geometries
+  st_make_valid()
+```
+
+Self-check to confirm the mask is an sf object
+
+```{r}
+# check class of mask to confirm it's an sf object
+class(blackout_mask)
+```
+
+##### crop the vectorized map to Houston
+
+We can define the Houston metropolitan area with the following coordinates:
+-   (-96.5, 29), (-96.5, 30.5), (-94.5, 30.5), (-94.5, 29)
+
+Using `st_polygon()` we can turn a list of the coordinates into a polygon that outlines Houston. We are using this polygon to crop our night lights data so we need to convert it to an `sf` object and assign the same CRS as the night lights.
+
+Now that our polygon is prepared, we can crop (spatiall subset) the blackout mask to the Houston area and then reproject the cropped mask to EPSG:3083 (NAD83 / Texas Centric Albers Equal Area).
+
+```{r include=TRUE}
+# define Houston coordinates in a matrix
+houston_matrix <- cbind(
+  x = c(-96.5, -96.5, -94.5, -94.5, -96.5),
+  y = c(29, 30.5, 30.5, 29, 29))
+
+# create a simple feature collection of a polygon of houston, set crs to same as night lights objects
+houston_polygon <- st_sfc(st_polygon(list(houston_matrix)), crs = st_crs(feb_7))
+
+# crop blackout mask to houston boundaries
+houston_blackout <- blackout_mask[houston_polygon, ]
+
+# reproject to 3083
+houston_blackout_3083 <- st_transform(houston_blackout, "EPSG:3083")
+```
+
+Self-check
+
+```{r}
+# check crs
+print(st_crs(houston_blackout_3083))
+
+# check the crop
+plot(houston_blackout_3083)
+```
+
+##### exclude highways from blackout mask
+
+As mentioned above, we will exclude highways from our mask because they produce a lot of light that we don't care about in this analysis. To access the layers we want from our geopackage, we will subset using a SQL query when loading the data. We can then create a 200 m buffer around all the highways to find areas that experienced blackouts further than 200 m from a highway.
+
+`query <- "SELECT * FROM gis_osm_roads_free_1 WHERE fclass='motorway'"`\
+`highways <- st_read("data/gis_osm_roads_free_1.gpkg", query = query)`
+
+```{r include=TRUE}
+# define SQL query
+query <- "SELECT * FROM gis_osm_roads_free_1 WHERE fclass='motorway'"
+
+#load highway data
+highways <- st_read("~/Documents/github/eds223-assignments/assignment-3-amandaherbst/data/gis_osm_roads_free_1.gpkg", 
+                    query = query,
+                    quiet = TRUE)
+
+# reproject to 3083
+highways_3083 <- st_transform(highways, "EPSG:3083")
+
+# make a buffer around 200m of houston highways (crs documentation says length measured in meters)
+# dissolve buffers with st_union
+highways_buffer <- st_union(st_buffer(highways_3083, dist = 200))
+
+# find areas in houston that experienced blackouts further than 200m from a highway
+houston_blackout_non_highway <- st_difference(houston_blackout_3083, highways_buffer)
+# st_disjoint is too strict
+```
+Self-check
+```{r}
+plot(highways_buffer)
+```
+
+#### Find homes impacted by blackouts
+
+##### load buildings data
+
+We will load the buildings dataset in the same manner we loaded the roads and select only residential buildings.
+
+`SELECT *`  `FROM gis_osm_buildings_a_free_1`\
+`WHERE (type IS NULL AND name IS NULL)`\
+`OR type in ('residential', 'apartments', 'house', 'static_caravan', 'detached')`\
+
+```{r include=TRUE}
+# define SQL query
+query <- "SELECT * FROM gis_osm_buildings_a_free_1 WHERE (type IS NULL AND name IS NULL) OR type in ('residential', 'apartments', 'house', 'static_caravan', 'detached')"
+
+#load building data
+buildings <- st_read("~/Documents/github/eds223-assignments/assignment-3-amandaherbst/data/gis_osm_buildings_a_free_1.gpkg", 
+                     query = query,
+                     quiet = TRUE)
+
+# reproject to 3083
+buildings_3083 <- st_transform(buildings, "EPSG:3083")
+```
+
+##### find homes in blackout areas
+
+Now we can filter to homes within blackout areas and count the number of impacted homes.
+
+```{r include=TRUE}
+# filter buildings to homes within blackout areas
+houston_home_blackout <- buildings_3083[houston_blackout_non_highway,]
+```
+Self-check
+```{r}
+head(houston_home_blackout)
+```
+
+```{r}
+print("Number of impacted homes:")
+n_distinct(houston_home_blackout$osm_id)
+```
+
+#### Investigate socioeconomic factors
+
+##### load ACS data
+
+Finally, let's load our socioeconomic data. The geometries are storied in the `ACS_2019_5YR_TRACT_48_TEXAS` layer and the income data is stored in the `X19_INCOME` layer. We'll select the median income field, `B19013e1`, for our analysis.
+
+```{r include=TRUE}
+# read in geometry layer and reproject to EPSG:3083
+acs_geometries_3083 <- st_read("~/Documents/github/eds223-assignments/assignment-3-amandaherbst/data/ACS_2019_5YR_TRACT_48_TEXAS.gdb", 
+                               layer = "ACS_2019_5YR_TRACT_48_TEXAS",
+                               quiet = TRUE) %>% 
+  st_transform("EPSG:3083")
+# Read in income layer
+acs_median_income <- st_read("~/Documents/github/eds223-assignments/assignment-3-amandaherbst/data/ACS_2019_5YR_TRACT_48_TEXAS.gdb", 
+                             layer = "X19_INCOME",
+                             quiet = TRUE) %>% 
+  # select median income column (and GEOID for joining)
+  select("B19013e1", "GEOID")
+```
+Self-check
+```{r}
+# check CRS of geometries
+st_crs(acs_geometries_3083)
+
+head(acs_median_income)
+```
+
+##### determine which census tracts experienced blackouts
+
+Let's combine the geometries and median income data, then spatially join with the buildings determined to be impacted by blackouts to find which census tracts had blackouts.
+
+```{r include=TRUE}
+# rename income columns to get ready to join
+acs_median_income <- acs_median_income %>% 
+  # rename GEIOD column to match correct column in geometries layer
+  rename("GEOID_Data" = GEOID,
+         # rename median income for easier use later
+         "median_income" = B19013e1)
+# join 
+acs_data <- left_join(acs_geometries_3083, acs_median_income, by = "GEOID_Data")
+
+# spatially join census data with buildings impaacted by blackouts
+census_blackout <- st_join(acs_data, houston_home_blackout, left = FALSE)
+
+print("The number of census tracts that experienced blackouts:")
+length(unique(census_blackout$GEOID))
+```
+
+##### compare incomes of impacted tracts to unimpacted tracts
+
+To visualize the socioeconomic factors, we can visualize our analysis by creating a map of median income by census tract and designate which tracts had blackouts. Also, we can plot the distribution of income in impacted and unimpacted tracts.
+
+```{r}
+# census tracts cropped to houston for plotting
+acs_data_houston = st_crop(acs_data, houston_blackout_3083)
+
+# create centroids of impacted census tracts to designate which ones had blackouts
+tract_blackout_centroids <- st_centroid(census_blackout)
+
+# plot houston census tracts 
+m1 <- ggplot() +
+  # color by median income
+  geom_sf(data = acs_data_houston, aes(fill = median_income)) +
+  # legend title and map title
+  labs(fill = "Median Income ($)",
+       title = "Houston Census Tract Income Distribution",
+       subtitle = "Tracts that experienced blackouts indicated by centroids") +
+  # adjust color scale
+  scale_fill_viridis_c(direction = -1) +
+  # add compass
+  annotation_north_arrow(location = "br",
+                         style = ggspatial::north_arrow_fancy_orienteering(),
+                         pad_x = unit(0, "in"),
+                         pad_y = unit(0.1, "in")) +
+  # add scale bar
+  annotation_scale(plot_unit = "m") +
+  # add impacted census tract centroids to indicate which ones had blackouts
+  geom_sf(data = tract_blackout_centroids, size = .5) +
+  theme_bw()
+
+m1
+
+ggsave("income_blackout_map.png", plot = m1, path = "../Outputs")
+```
+
+```{r}
+# plot the distribution of income in impacted and unimpacted tracts
+
+# take unique names of census tracts in blackout and filter original census dataframe
+
+# IDs of each census tract in a blackout:
+# unique(census_blackout$GEOID)
+
+# create dataframe of only unimpacted census tracts
+unimpacted <- acs_data_houston %>% 
+  # filter for census tract IDs that do NOT match the IDs of impacted tracts
+  filter(!GEOID %in% c(unique(census_blackout$GEOID)))
+
+# create dataframe of only impacted census tracts
+impacted <- acs_data_houston %>% 
+  # filter for census tract IDs that match the IDs of impacted tracts
+  filter(GEOID %in% c(unique(census_blackout$GEOID)))
+
+# plot income distribution in unimpacted tracts
+unimpact <- ggplot(data = unimpacted) +
+  geom_histogram(aes(x = median_income),
+                 fill = "cornflowerblue") +
+  labs(title = "Unimpacted Census Tracts",
+       x = "Median Income ($)",
+       y = "")+
+  # set y-scale so both plots match
+  ylim(0, 100)
+
+# plot income distribution of impacted tracts
+impact <- ggplot(data = impacted) +
+  geom_histogram(aes(x = median_income),
+                 fill = "black") +
+  labs(title = "Impacted Census Tracts",
+       x = "Median Income ($)",
+       y = "") +
+  # set y-scale so both plots match
+  ylim(0, 100)
+
+# show both plots side by side
+p1 <- unimpact + impact
+
+p1
+
+ggsave("income_distributions.png", plot = p1, path = "../Outputs")
+```
+**The income distributions in impacted versus unimpacted census tracts look similar. The most common median incomes for both groups are around $50,000. Overall, it appears the at all income levels, more tracts were impacted by blackouts than not, but I cannot conclude if the median income of a census tract affects the ability of a community to recover from a power outage. Further studies could include looking at additional socioeconomic factors beyond income such as the percent of people of color, average highest level of education, and the percent of unemployment to better understand the influence of socioeconomic factors on community recovery. Additionally, this study only compared two days during a storm that lasted a few weeks, so comparing additional days and/or additional storms would allow for better conclusions.**
